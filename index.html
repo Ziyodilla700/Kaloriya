@@ -386,15 +386,26 @@ function calcGoal(u) {
 const GAPI = "https://generativelanguage.googleapis.com/v1beta";
 const LANG = { uz: "o'zbek (lotin)", ru: "rus", en: "ingliz" };
 
-async function gfetch(path, body) {
-  const r = await fetch(GAPI + path, {
-    method: body ? "POST" : "GET",
-    headers: { "x-goog-api-key": S.key, ...(body ? { "Content-Type": "application/json" } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+async function gfetch(path, body, timeoutMs = 45000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let r;
+  try {
+    r = await fetch(GAPI + path, {
+      method: body ? "POST" : "GET",
+      headers: { "x-goog-api-key": S.key, ...(body ? { "Content-Type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    throw new Error(e.name === "AbortError"
+      ? "Google serveri javob bermadi. Internetni tekshiring yoki VPN yoqib qayta urinib ko'ring."
+      : "Google serveriga ulanib bo'lmadi. Internet yoki VPN'ni tekshiring.");
+  } finally { clearTimeout(timer); }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     const msg = data?.error?.message || "";
+    if (/location is not supported/i.test(msg)) throw new Error("Google bu mamlakatdan bepul API'ga ruxsat bermayapti. VPN yoqib qayta urinib ko'ring.");
     if (r.status === 400 && /API key/i.test(msg) || r.status === 403) throw new Error("API kalit noto'g'ri yoki faol emas. Profilda tekshiring.");
     if (r.status === 429) throw new Error("Bepul limit vaqtincha tugadi. Bir daqiqadan keyin urinib ko'ring.");
     throw new Error("AI xatosi: " + (msg || r.status));
@@ -406,14 +417,14 @@ async function pickModel() {
   if (S.model) return S.model;
   const cached = LS.get("model");
   try {
-    const d = await gfetch("/models?pageSize=200");
+    const d = await gfetch("/models?pageSize=200", null, 20000);
     const ok = (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
       .map(m => m.name).filter(n => /gemini-[\d.]+-flash/.test(n) && !/lite|image|tts|live|audio|thinking|exp|preview|\d{3,}$/.test(n));
     const ver = n => parseFloat((n.match(/gemini-([\d.]+)/) || [])[1] || 0);
     ok.sort((a, b) => ver(b) - ver(a) || a.length - b.length);
     S.model = ok[0] || cached || "models/gemini-2.5-flash";
   } catch (e) {
-    if (/kalit|limit/.test(e.message)) throw e;
+    if (/kalit|limit|Google|VPN/.test(e.message)) throw e;
     S.model = cached || "models/gemini-2.5-flash";
   }
   LS.set("model", S.model);
@@ -794,7 +805,7 @@ $("keySave").onclick = async () => {
   const old = S.key; S.key = key; S.model = null;
   try {
     const model = await pickModel();
-    await gfetch(`/${model}:generateContent`, { contents: [{ role: "user", parts: [{ text: "Faqat OK deb javob bering." }] }] });
+    await gfetch(`/${model}:generateContent`, { contents: [{ role: "user", parts: [{ text: "Faqat OK deb javob bering." }] }] }, 20000);
     await store.set("k", key);
     $("keyMsg").textContent = `Kalit ishlayapti ✓ (model: ${model.replace("models/", "")})`;
     haptic("success"); renderDay();
