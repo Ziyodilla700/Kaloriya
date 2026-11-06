@@ -407,33 +407,54 @@ async function gfetch(path, body, timeoutMs = 45000) {
     const msg = data?.error?.message || "";
     if (/location is not supported/i.test(msg)) throw new Error("Google bu mamlakatdan bepul API'ga ruxsat bermayapti. VPN yoqib qayta urinib ko'ring.");
     if (r.status === 400 && /API key/i.test(msg) || r.status === 403) throw new Error("API kalit noto'g'ri yoki faol emas. Profilda tekshiring.");
-    if (r.status === 429) throw new Error("Bepul limit vaqtincha tugadi. Bir daqiqadan keyin urinib ko'ring.");
-    throw new Error("AI xatosi: " + (msg || r.status));
+    const err = new Error(r.status === 429 ? "Bepul limit vaqtincha tugadi. Bir daqiqadan keyin urinib ko'ring." : "AI xatosi: " + (msg || r.status));
+    err.status = r.status;
+    throw err;
   }
   return data;
 }
-/* Eng yangi barqaror "flash" modelini avtomatik tanlaymiz — Google modellarni yangilasa ham ishlayveradi */
-async function pickModel() {
-  if (S.model) return S.model;
-  const cached = LS.get("model");
+/* Bepul "flash" modellar ro'yxati (yangisidan eskisiga, oxirida "lite").
+   Bittasi band yoki limiti tugagan bo'lsa, keyingisiga o'tamiz. */
+const FALLBACK = ["models/gemini-2.5-flash", "models/gemini-2.0-flash", "models/gemini-2.5-flash-lite", "models/gemini-2.0-flash-lite"];
+async function listModels() {
+  if (S.models) return S.models;
+  let names = [];
   try {
     const d = await gfetch("/models?pageSize=200", null, 20000);
-    const ok = (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
-      .map(m => m.name).filter(n => /gemini-[\d.]+-flash/.test(n) && !/lite|image|tts|live|audio|thinking|exp|preview|\d{3,}$/.test(n));
-    const ver = n => parseFloat((n.match(/gemini-([\d.]+)/) || [])[1] || 0);
-    ok.sort((a, b) => ver(b) - ver(a) || a.length - b.length);
-    S.model = ok[0] || cached || "models/gemini-2.5-flash";
+    names = (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+      .map(m => m.name).filter(n => /gemini-[\d.]+-flash/.test(n) && !/image|tts|live|audio|thinking|exp|preview|\d{3,}$/.test(n));
   } catch (e) {
-    if (/kalit|limit|Google|VPN/.test(e.message)) throw e;
-    S.model = cached || "models/gemini-2.5-flash";
+    if (/kalit|Google|VPN|mamlakat/.test(e.message)) throw e;
   }
-  LS.set("model", S.model);
-  return S.model;
+  const ver = n => parseFloat((n.match(/gemini-([\d.]+)/) || [])[1] || 0);
+  const lite = n => /lite/.test(n) ? 1 : 0;
+  names.sort((x, y) => lite(x) - lite(y) || ver(y) - ver(x) || x.length - y.length);
+  for (const f of FALLBACK) if (!names.includes(f)) names.push(f);
+  const last = LS.get("model");
+  if (last && names.includes(last)) names = [last, ...names.filter(n => n !== last)];
+  S.models = names;
+  return names;
+}
+/* Modellarni navbat bilan sinab ko'radi: band (503), limit (429) yoki topilmasa (404) — keyingisi */
+async function generate(body, timeoutMs) {
+  const models = await listModels();
+  let lastErr;
+  for (const m of models) {
+    try {
+      const d = await gfetch(`/${m}:generateContent`, body, timeoutMs);
+      if (S.model !== m) { S.model = m; LS.set("model", m); S.models = [m, ...models.filter(x => x !== m)]; }
+      return d;
+    } catch (e) {
+      lastErr = e;
+      if (![429, 500, 503, 404].includes(e.status)) throw e;
+    }
+  }
+  if (lastErr?.status === 429) throw new Error("Bepul limit vaqtincha tugadi. Bir necha daqiqadan keyin urinib ko'ring.");
+  throw new Error("Google modellari hozir band. 1–2 daqiqadan keyin qayta urinib ko'ring.");
 }
 async function askJSON(parts) {
   if (!S.key) throw new Error("Avval Profil bo'limida Gemini API kalitini kiriting.");
-  const model = await pickModel();
-  const d = await gfetch(`/${model}:generateContent`, {
+  const d = await generate({
     contents: [{ role: "user", parts }],
     generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
   });
@@ -802,12 +823,19 @@ $("keySave").onclick = async () => {
   const key = $("fKey").value.trim();
   if (!key) return ($("keyMsg").textContent = "Kalitni kiriting.");
   const btn = $("keySave"); btn.disabled = true; btn.innerHTML = `<span class="spinner"></span>Tekshirilmoqda…`;
-  const old = S.key; S.key = key; S.model = null;
+  const old = S.key; S.key = key; S.model = null; S.models = null;
   try {
-    const model = await pickModel();
-    await gfetch(`/${model}:generateContent`, { contents: [{ role: "user", parts: [{ text: "Faqat OK deb javob bering." }] }] }, 20000);
+    let note = "";
+    try {
+      await generate({ contents: [{ role: "user", parts: [{ text: "Faqat OK deb javob bering." }] }] }, 20000);
+      note = ` (model: ${S.model.replace("models/", "")})`;
+    } catch (e) {
+      // Model band yoki limit — kalitning o'zi to'g'ri, saqlab qo'yamiz
+      if (!/band|limit/.test(e.message)) throw e;
+      note = ". Modellar hozir band, ovqat qo'shganda qayta urinib ko'ring.";
+    }
     await store.set("k", key);
-    $("keyMsg").textContent = `Kalit ishlayapti ✓ (model: ${model.replace("models/", "")})`;
+    $("keyMsg").textContent = "Kalit ishlayapti ✓" + note;
     haptic("success"); renderDay();
   } catch (e) {
     S.key = old; $("keyMsg").textContent = e.message; haptic("error");
